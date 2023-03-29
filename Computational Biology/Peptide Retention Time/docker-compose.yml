@@ -1,0 +1,101 @@
+version: '1'
+
+services:
+
+  # This container runs the postgresql database for mlflow.
+  postgres-mlflow:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: mlflow
+      POSTGRES_DB: mlflow
+    volumes:
+      # The data folder is a named volume mounted to /var/lib/postgresql/data
+      - postgres-db-volume-mlflow:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "mlflow", "-i" ]
+      interval: 5s
+      retries: 5
+    restart: always
+
+  # This container runs the artifact storage as an S3 server.
+  s3-artifact-storage:
+    # The base image is minio which is a minimalistic S3 server.
+    image: minio/minio
+    volumes:
+      # We want to serve the content from the named volume "mlflow-data" through the S3 server
+      # All artifacts will be stored in this volume.
+      - mlflow-data:/data
+    environment:
+      # The following credentials are for both login (through localhost:9001) and access to the S3 server (localhost:9000).
+      &env-mlflow-s3
+      MINIO_ROOT_USER: mlflow_user
+      MINIO_ROOT_PASSWORD: mlflow_passwd
+
+    # Launches the S3 server on port 9000 and the login server on port 9001.
+    command: server /data --console-address ":9001"
+    ports:
+      - 9000:9000
+      - 9001:9001
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl -I http://localhost:9000/minio/health/live"
+        ]
+      interval: 5s
+      retries: 5
+    restart: always
+
+  # This container creates the "data" in the S3 server, in which mlflow will later store the artifacts.
+  mlflow-init:
+    image: minio/mc
+    depends_on:
+      - s3-artifact-storage
+    environment:
+      <<: *env-mlflow-s3
+    entrypoint: >
+      /bin/sh -c " /usr/bin/mc config host add myminio http://s3-artifact-storage:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD; /usr/bin/mc mb myminio/data; /usr/bin/mc policy download myminio/data; exit 0; "
+
+  # This container runs the webserver for mlflow.
+  mlflow-webserver:
+    build: ./docker/mlflow
+    image: mlflow_server
+    ports:
+      - 5000:5000
+    environment:
+      # The following credentials allow connection to the S3 server.
+      MLFLOW_S3_ENDPOINT_URL: http://s3-artifact-storage:9000
+      MLFLOW_S3_IGNORE_TLS: "true"
+      AWS_ACCESS_KEY_ID: "mlflow_user"
+      AWS_SECRET_ACCESS_KEY: "mlflow_passwd"
+
+    # The following command will launch the mlflow webserver on port 5000, with postgresql as the database and S3 as the artifact storage.
+    # The option "--serve-artifacts" will enable the serving of artifacts through mlflow as a proxy to the S3 server.
+    command: mlflow server --backend-store-uri postgresql://mlflow:mlflow@postgres-mlflow/mlflow --artifacts-destination s3://data -h 0.0.0.0 -p 5000 --serve-artifacts
+    depends_on:
+      - postgres-mlflow
+      - s3-artifact-storage
+      - mlflow-init
+
+  # This container runs the jupyter kernel
+  jupyter:
+    image: jupyter
+    # docker-compose build befere you can use the image in docker-compose up again. 
+    build: ./docker/jupyter
+    ports:
+      - 8888:8888
+    environment:
+      # JUPYTER_ENABLE_LAB: "yes" # If you prefer jupyter-lab
+      JUPYTER_TOKEN: "peptide"
+      # Sets the tracking uri env variable for mlflow in jupyter
+      MLFLOW_TRACKING_URI: "http://mlflow-webserver:5000"
+      GIT_PYTHON_REFRESH: "quiet"
+    volumes:
+      - ./:/work/
+    entrypoint: sh -c 'jupyter notebook --ip=0.0.0.0 --port=8888 --no-browser --notebook-dir=/work --allow-root'
+
+volumes:
+
+  postgres-db-volume-mlflow:
+  mlflow-data:
